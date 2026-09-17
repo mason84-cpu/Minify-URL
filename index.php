@@ -11,136 +11,102 @@ error_reporting(E_ALL); // remove this line in production
 ini_set('display_errors', '1'); // remove this line in production
 date_default_timezone_set('Europe/London');
 
-class UrlShortener {
-    private PDO $db;
+require __DIR__ . '/vendor/autoload.php';
 
-    public function __construct(PDO $db) {
-        $this->db = $db;
-        $this->initTable();
-    }
+use App\RateLimitExceededException;
+use App\UrlShortener;
 
-    private function initTable(): void {
-        $this->db->exec("CREATE TABLE IF NOT EXISTS urls (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            long_url TEXT NOT NULL,
-            short_code TEXT UNIQUE NOT NULL,
-            expires_at DATETIME NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )");
-    }
-
-    public function createShortUrl(string $longUrl, ?string $expiresAt): string {
-        // check valid URL
-        if (!filter_var($longUrl, FILTER_VALIDATE_URL)) {
-            throw new InvalidArgumentException("$longUrl is not a valid URL.");
-        }
-
-        // check if expiresAt is valid format
-        if ($expiresAt !== null && !strtotime($expiresAt)) {
-            throw new InvalidArgumentException("Invalid expiration date format.");
-        }
-
-        // check expiresAt is in the future
-        if ($expiresAt !== null && strtotime($expiresAt) < time()) {
-            throw new InvalidArgumentException("Expiration date must be in the future.");
-        }
-
-        // normalise date format to 'Y-m-d H:i:s' for database storage
-        if ($expiresAt !== null) {
-            $expiresAt = date('Y-m-d H:i:s', strtotime($expiresAt));
-        }
-
-        // generate a random short code
-        $shortCode = $this->generateRandomShortCode();
-
-        // try to insert into db, if it fails due to unique constraint, generate a new short code and try again
-        try {
-            $params = [
-                ':long_url' => $longUrl,
-                ':short_code' => $shortCode,
-                ':expires_at' => $expiresAt
-            ];
-            $sql = "INSERT INTO urls (long_url, short_code, expires_at) VALUES (:long_url, :short_code, :expires_at)";
-            $query = $this->db->prepare($sql);
-            $query->execute($params);
-        } catch (PDOException $e) {
-            if ($e->getCode() === '23000') { // unique constraint violation
-                return $this->createShortUrl($longUrl, $expiresAt); // retry with a new short code
-            }
-            throw $e; // rethrow other database errors
-        }
-
-        return "//" . ($_SERVER['HTTP_HOST'] ?? "localhost") . "/urls/" . $shortCode; //returns //localhost/urls/abcd12
-    }
-
-    public function resolveUrl(string $shortCode): string {
-        $params = [':short_code' => $shortCode];
-        $sql = "SELECT long_url, expires_at 
-                FROM urls 
-                WHERE short_code = :short_code";
-        $query = $this->db->prepare($sql);
-        $query->execute($params);
-        $row = $query->fetch(PDO::FETCH_ASSOC);
-        if ($row) {
-            if ($row['expires_at'] === null || strtotime($row['expires_at']) > time()) {
-                return $row['long_url'];
-            }
-        }
-        throw new InvalidArgumentException("URL not found or expired.");
-    }
-
-    private function generateRandomShortCode(int $length = 5): string {
-        $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-        $charLen = strlen($chars);
-        $shortCode = '';
-        
-        for ($i = 0; $i < $length; $i++) {
-            // random_int() is cryptographically secure
-            $randomIndex = random_int(0, $charLen - 1);
-            $shortCode .= $chars[$randomIndex];
-        }
-        
-        return $shortCode;
-    }
+function render404(string $message): never {
+    http_response_code(404);
+    echo '<!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>404 Not Found</title>
+                <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+            </head>
+            <body class="bg-slate-100 flex items-center justify-center h-screen">
+                <div class="bg-white p-8 rounded-xl shadow-md text-center">
+                    <h1 class="text-2xl font-bold text-red-600 mb-2">404</h1>
+                    <p class="text-slate-600">' . htmlspecialchars($message) . '</p>
+                </div>
+            </body>
+            </html>';
+    exit;
 }
 
 //initialise database and UrlShortener class
 $db = new PDO('sqlite:' . __DIR__ . '/db_urls.db');
 $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-// testing expiry date - this would never be in production code, just for testing purposes
-// $db->exec("UPDATE urls SET expires_at = '2020-01-01 00:00:00' WHERE short_code = 's4pX6'");
-// exit("Updated expiry date.");
 
 $shortener = new UrlShortener($db);
-// handle URL resolution
+// base path (empty) shows the generator form; anything else is treated as a short code to resolve.
+// a trailing '+' (bit.ly-style) shows click stats for the code instead of redirecting.
 $requestPath = trim(parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH), '/');
 
-if (str_starts_with($requestPath, 'urls/')) {
-    $shortCode = substr($requestPath, strlen('urls/'));
+if ($requestPath !== '') {
+    if (str_ends_with($requestPath, '+')) {
+        $shortCode = substr($requestPath, 0, -1);
+        try {
+            $stats = $shortener->getStats($shortCode);
+        } catch (InvalidArgumentException $e) {
+            render404($e->getMessage());
+        }
+
+        ?>
+        <!DOCTYPE html>
+        <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Stats for <?php echo htmlspecialchars($stats['short_code']); ?></title>
+                <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+            </head>
+            <body class="bg-slate-100 flex items-center justify-center h-screen">
+                <div class="bg-white p-8 rounded-xl shadow-md w-full max-w-lg">
+                    <h1 class="text-2xl font-bold text-indigo-600 mb-4">Stats for /<?php echo htmlspecialchars($stats['short_code']); ?></h1>
+                    <dl class="space-y-3 text-sm">
+                        <div>
+                            <dt class="text-gray-500">Destination</dt>
+                            <dd class="text-slate-800 break-all"><?php echo htmlspecialchars($stats['long_url']); ?></dd>
+                        </div>
+                        <div>
+                            <dt class="text-gray-500">Status</dt>
+                            <dd class="<?php echo $stats['expired'] ? 'text-red-600' : 'text-green-600'; ?>"><?php echo $stats['expired'] ? 'Expired' : 'Active'; ?></dd>
+                        </div>
+                        <div>
+                            <dt class="text-gray-500">Visits</dt>
+                            <dd class="text-slate-800"><?php echo (int) $stats['visits']; ?></dd>
+                        </div>
+                        <div>
+                            <dt class="text-gray-500">Created</dt>
+                            <dd class="text-slate-800"><?php echo htmlspecialchars($stats['created_at']); ?></dd>
+                        </div>
+                        <div>
+                            <dt class="text-gray-500">Expires</dt>
+                            <dd class="text-slate-800"><?php echo htmlspecialchars($stats['expires_at'] ?? 'Never'); ?></dd>
+                        </div>
+                        <div>
+                            <dt class="text-gray-500">Last accessed</dt>
+                            <dd class="text-slate-800"><?php echo htmlspecialchars($stats['last_accessed_at'] ?? 'Never'); ?></dd>
+                        </div>
+                    </dl>
+                    <a href="/" class="inline-block mt-6 text-sm text-blue-600 underline">&larr; Create another link</a>
+                </div>
+            </body>
+        </html>
+        <?php
+        exit;
+    }
+
+    $shortCode = $requestPath;
     try {
         $longUrl = $shortener->resolveUrl($shortCode);
-        if ($longUrl) {
-            header("Location: $longUrl");
-            exit;
-        }
+        header("Location: $longUrl");
+        exit;
     } catch (InvalidArgumentException $e) {
-        http_response_code(404);
-        echo '<!DOCTYPE html>
-                <html lang="en">
-                <head>
-                    <meta charset="UTF-8">
-                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                    <title>404 Not Found</title>
-                    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-                </head>
-                <body class="bg-slate-100 flex items-center justify-center h-screen">
-                    <div class="bg-white p-8 rounded-xl shadow-md text-center">
-                        <h1 class="text-2xl font-bold text-red-600 mb-2">404</h1>
-                        <p class="text-slate-600">' . htmlspecialchars($e->getMessage()) . '</p>
-                    </div>
-                </body>
-                </html>';
-        exit;     
+        render404($e->getMessage());
     }
 }
 
@@ -152,9 +118,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $longUrl = $_POST['url'] ?? '';
     $expiresAt = trim($_POST['expires_at'] ?? '');
     $expiresAt = $expiresAt !== '' ? $expiresAt : null;
+    $customCode = trim($_POST['custom_code'] ?? '');
+    $customCode = $customCode !== '' ? $customCode : null;
 
     try {
-        $shortUrl = $shortener->createShortUrl($longUrl, $expiresAt);
+        $shortener->enforceRateLimit($_SERVER['REMOTE_ADDR'] ?? '0.0.0.0');
+        $shortUrl = $shortener->createShortUrl($longUrl, $expiresAt, $customCode);
+    } catch (RateLimitExceededException $e) {
+        http_response_code(429);
+        $errorMessage = $e->getMessage();
     } catch (InvalidArgumentException $e) {
         $errorMessage = $e->getMessage();
     }
@@ -170,7 +142,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <title>Mason Chan - URL Shortener</title>
 
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-        
+
     </head>
     <body class="bg-slate-100 flex items-center justify-center h-screen">
 
@@ -187,9 +159,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <p class="text-green-600 mb-4">
                     Your short URL is: <a href="<?php echo htmlspecialchars($shortUrl); ?>" class="text-blue-600 underline"><?php echo htmlspecialchars($shortUrl); ?></a>
                 </p>
-                <button id="copy-btn" class="w-full md:w-auto px-6 py-2.5 bg-blue-600 text-white font-medium rounded-lg shadow-sm hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 text-sm transition-colors">
-                    Copy URL
-                </button>
+                <div class="flex items-center gap-4">
+                    <button id="copy-btn" class="px-6 py-2.5 bg-blue-600 text-white font-medium rounded-lg shadow-sm hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 text-sm transition-colors">
+                        Copy URL
+                    </button>
+                    <a href="<?php echo htmlspecialchars($shortUrl); ?>+" class="text-sm text-slate-500 underline">View stats</a>
+                </div>
                 <script>
                     document.getElementById('copy-btn').addEventListener('click', function() {
                         navigator.clipboard.writeText('<?php echo htmlspecialchars($shortUrl); ?>');
@@ -200,6 +175,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     <div class="w-full md:flex-[2]">
                         <label for="url-input" class="block text-sm font-medium text-gray-700 mb-1">URL</label>
                         <input type="url" id="url-input" name="url" class="w-full px-4 py-2.5 border border-gray-300 rounded-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-sm" placeholder="https://www.google.com" required>
+                    </div>
+
+                    <div class="w-full md:flex-1">
+                        <label for="custom-code" class="block text-sm font-medium text-gray-700 mb-1">Custom Code (optional)</label>
+                        <input type="text" id="custom-code" name="custom_code" pattern="[A-Za-z0-9_-]{3,32}" maxlength="32" class="w-full px-4 py-2.5 border border-gray-300 rounded-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-sm" placeholder="my-link">
                     </div>
 
                     <div class="w-full md:flex-1">
@@ -217,5 +197,5 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         </div>
 
     </body>
-    
+
 </html>
