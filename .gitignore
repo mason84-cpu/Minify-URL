@@ -1,0 +1,4 @@
+/vendor/
+/db_urls.db
+.phpunit.cache/
+.phpunit.result.cache
